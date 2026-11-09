@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.dyvolguard"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
     }
 
     signingConfigs {
@@ -37,6 +37,6 @@ android {
 }
 
 dependencies {
-    // 经典 Xposed API，LSPosed 完整兼容；只编译不打包
-    compileOnly("de.robv.android.xposed:api:82")
+    // libxposed 现代 API（LSPosed 2.2.1 = API 102），只编译不打包
+    compileOnly("io.github.libxposed:api:102.0.0")
 }
