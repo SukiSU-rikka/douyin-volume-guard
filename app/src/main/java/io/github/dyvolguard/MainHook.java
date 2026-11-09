@@ -1,6 +1,7 @@
 package io.github.dyvolguard;
 
 import android.app.Activity;
+import android.content.SharedPreferences;
 import android.media.AudioManager;
 import android.media.session.MediaController;
 import android.os.SystemClock;
@@ -16,7 +17,7 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * 抖音音量守卫（libxposed API 102）
  * 拦截抖音进程里所有"调大系统音量 / 取消静音"的调用。
- * 用户刚按过音量键（KEY_WINDOW_MS 内）时放行；调低始终放行。
+ * 用户刚按过音量键（放行时长可在界面里调）时放行；调低始终放行。
  */
 public class MainHook extends XposedModule {
 
@@ -25,10 +26,10 @@ public class MainHook extends XposedModule {
             "com.ss.android.ugc.aweme",
             "com.ss.android.ugc.aweme.lite"
     };
-    private static final long KEY_WINDOW_MS = 1000;
-
     private static volatile long lastVolumeKeyAt = -100_000;
     private boolean hooked = false;
+    /** 模块界面写入的远程配置（只读）；取不到时用默认值 */
+    private SharedPreferences prefs;
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
@@ -36,6 +37,11 @@ public class MainHook extends XposedModule {
         synchronized (this) {
             if (hooked) return;
             hooked = true;
+        }
+        try {
+            prefs = getRemotePreferences(Prefs.GROUP);
+        } catch (Throwable t) {
+            warn("remote prefs unavailable, using defaults: " + t);
         }
         info("active in " + param.getPackageName());
         hookKeyTracking();
@@ -86,8 +92,34 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private static boolean userJustPressed() {
-        return SystemClock.uptimeMillis() - lastVolumeKeyAt < KEY_WINDOW_MS;
+    private boolean enabled() {
+        try {
+            return prefs == null ? Prefs.DEF_ENABLED : prefs.getBoolean(Prefs.ENABLED, Prefs.DEF_ENABLED);
+        } catch (Throwable t) {
+            return Prefs.DEF_ENABLED;
+        }
+    }
+
+    private long keyWindowMs() {
+        try {
+            return prefs == null ? Prefs.DEF_KEY_WINDOW_MS : prefs.getInt(Prefs.KEY_WINDOW_MS, Prefs.DEF_KEY_WINDOW_MS);
+        } catch (Throwable t) {
+            return Prefs.DEF_KEY_WINDOW_MS;
+        }
+    }
+
+    private boolean logEnabled() {
+        try {
+            return prefs == null ? Prefs.DEF_LOG : prefs.getBoolean(Prefs.LOG, Prefs.DEF_LOG);
+        } catch (Throwable t) {
+            return Prefs.DEF_LOG;
+        }
+    }
+
+    /** true = 需要检查并可能拦截；false = 直接放行 */
+    private boolean guarding() {
+        if (!enabled()) return false;
+        return SystemClock.uptimeMillis() - lastVolumeKeyAt >= keyWindowMs();
     }
 
     private static int intArg(XposedInterface.Chain chain, int i) {
@@ -102,7 +134,7 @@ public class MainHook extends XposedModule {
 
         // setStreamVolume(int streamType, int index, int flags)
         hookMethod(am, "setStreamVolume", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int stream = intArg(chain, 0);
                 int index = intArg(chain, 1);
                 int cur = ((AudioManager) chain.getThisObject()).getStreamVolume(stream);
@@ -115,7 +147,7 @@ public class MainHook extends XposedModule {
 
         // adjustStreamVolume(int streamType, int direction, int flags)
         hookMethod(am, "adjustStreamVolume", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int stream = intArg(chain, 0);
                 int dir = intArg(chain, 1);
                 if (isRaise((AudioManager) chain.getThisObject(), stream, dir)) {
@@ -127,7 +159,7 @@ public class MainHook extends XposedModule {
 
         // adjustVolume(int direction, int flags)
         hookMethod(am, "adjustVolume", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int dir = intArg(chain, 0);
                 if (isRaise((AudioManager) chain.getThisObject(), AudioManager.STREAM_MUSIC, dir)) {
                     return block("adjustVolume(dir=" + dir + ")");
@@ -138,7 +170,7 @@ public class MainHook extends XposedModule {
 
         // adjustSuggestedStreamVolume(int direction, int suggestedStreamType, int flags)
         hookMethod(am, "adjustSuggestedStreamVolume", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int dir = intArg(chain, 0);
                 int stream = intArg(chain, 1);
                 if (stream == AudioManager.USE_DEFAULT_STREAM_TYPE) stream = AudioManager.STREAM_MUSIC;
@@ -151,7 +183,7 @@ public class MainHook extends XposedModule {
 
         // setStreamMute(int, boolean)：拦截取消静音
         hookMethod(am, "setStreamMute", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 Object state = chain.getArg(1);
                 if (Boolean.FALSE.equals(state)) {
                     return block("setStreamMute(stream=" + chain.getArg(0) + ", false)");
@@ -164,7 +196,7 @@ public class MainHook extends XposedModule {
         for (Method m : am.getDeclaredMethods()) {
             if (!m.getName().equals("setVolumeIndexForAttributes")) continue;
             safeHook(m, chain -> {
-                if (!userJustPressed()) {
+                if (guarding()) {
                     return block("setVolumeIndexForAttributes(index=" + chain.getArg(1) + ")");
                 }
                 return chain.proceed();
@@ -188,7 +220,7 @@ public class MainHook extends XposedModule {
 
     private void hookMediaController() {
         hookMethod(MediaController.class, "setVolumeTo", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int value = intArg(chain, 0);
                 int cur = -1;
                 try {
@@ -205,7 +237,7 @@ public class MainHook extends XposedModule {
         }, int.class, int.class);
 
         hookMethod(MediaController.class, "adjustVolume", chain -> {
-            if (!userJustPressed()) {
+            if (guarding()) {
                 int dir = intArg(chain, 0);
                 if (dir == AudioManager.ADJUST_RAISE || dir == AudioManager.ADJUST_UNMUTE) {
                     return block("MediaController.adjustVolume(dir=" + dir + ")");
@@ -235,7 +267,7 @@ public class MainHook extends XposedModule {
 
     /** 拦截：不调用原方法，返回 null（这些方法都是 void） */
     private Object block(String what) {
-        info("BLOCKED " + what + callerHint());
+        if (logEnabled()) info("BLOCKED " + what + callerHint());
         return null;
     }
 
